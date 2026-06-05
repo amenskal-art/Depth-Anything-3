@@ -52,12 +52,6 @@ matplotlib.use("Agg")
 
 
 def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
-    """
-    depth: [N, H, W] numpy array or torch tensor
-    intrinsics: [N, 3, 3] numpy array or torch tensor
-    extrinsics: [N, 3, 4] (w2c) numpy array or torch tensor
-    Returns: point_cloud_world: [N, H, W, 3] same type as input
-    """
     input_is_numpy = False
     if isinstance(depth, np.ndarray):
         input_is_numpy = True
@@ -80,8 +74,6 @@ def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
         intrinsics_tensor = intrinsics_tensor.to(device)
         extrinsics_tensor = extrinsics_tensor.to(device)
 
-    # main logic
-
     N, H, W = depth_tensor.shape
 
     device = depth_tensor.device
@@ -91,7 +83,7 @@ def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
     ones = torch.ones((N, H, W, 1), device=device)
     pixel_coords = torch.cat([u, v, ones], dim=-1)
 
-    intrinsics_inv = torch.inverse(intrinsics_tensor)  # [N, 3, 3]
+    intrinsics_inv = torch.inverse(intrinsics_tensor) 
     camera_coords = torch.einsum("nij,nhwj->nhwi", intrinsics_inv, pixel_coords)
     camera_coords = camera_coords * depth_tensor.unsqueeze(-1)
     camera_coords_homo = torch.cat([camera_coords, ones], dim=-1)
@@ -111,9 +103,6 @@ def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
 
 
 def remove_duplicates(data_list):
-    """
-    data_list: [(67, (3386, 3406), 48, (2435, 2455)), ...]
-    """
     seen = {}
     result = []
 
@@ -131,14 +120,17 @@ def remove_duplicates(data_list):
 
 
 class DA3_Streaming:
-    def __init__(self, image_dir, save_dir, config):
+    def __init__(self, image_dir, save_dir, config, conf_threshold=1.5):
         self.config = config
+        
+        # Override the configuration dynamically based on the UI slider
+        if conf_threshold > 0.0:
+            self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"] = conf_threshold * 2.0
 
         self.chunk_size = self.config["Model"]["chunk_size"]
         self.overlap = self.config["Model"]["overlap"]
         self.overlap_s = 0
         self.overlap_e = self.overlap - self.overlap_s
-        self.conf_threshold = 1.5
         self.seed = 42
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = (
@@ -164,31 +156,18 @@ class DA3_Streaming:
 
         self.delete_temp_files = self.config["Model"]["delete_temp_files"]
 
-        print("Loading model...")
-
-        with open(self.config["Weights"]["DA3_CONFIG"]) as f:
-            config = json.load(f)
-        self.model = DepthAnything3(**config)
-        weight = load_file(self.config["Weights"]["DA3"])
-        self.model.load_state_dict(weight, strict=False)
-
+        print("Loading DA3 Nested Giant Large 1.1 from Hugging Face Hub...")
+        self.model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE-1.1")
         self.model.eval()
         self.model = self.model.to(self.device)
 
         self.skyseg_session = None
-
-        self.chunk_indices = None  # [(begin_idx, end_idx), ...]
-
-        self.loop_list = []  # e.g. [(1584, 139), ...]
-
+        self.chunk_indices = None 
+        self.loop_list = [] 
         self.loop_optimizer = Sim3LoopOptimizer(self.config)
-
-        self.sim3_list = []  # [(s [1,], R [3,3], T [3,]), ...]
-
-        self.loop_sim3_list = []  # [(chunk_idx_a, chunk_idx_b, s [1,], R [3,3], T [3,]), ...]
-
+        self.sim3_list = [] 
+        self.loop_sim3_list = [] 
         self.loop_predict_list = []
-
         self.loop_enable = self.config["Model"]["loop_enable"]
 
         if self.loop_enable:
@@ -225,10 +204,10 @@ class DA3_Streaming:
             global_idx = chunk_start + local_idx
             print(f"{global_idx}, ", end="")
 
-            image = predictions.processed_images[local_idx]  # [H, W, 3] uint8
-            depth = predictions.depth[local_idx]  # [H, W] float32
-            conf = predictions.conf[local_idx]  # [H, W] float32
-            intrinsics = predictions.intrinsics[local_idx]  # [3, 3] float32
+            image = predictions.processed_images[local_idx]  
+            depth = predictions.depth[local_idx] 
+            conf = predictions.conf[local_idx]  
+            intrinsics = predictions.intrinsics[local_idx]  
 
             filename = f"frame_{global_idx}.npz"
             filepath = os.path.join(self.result_output_dir, filename)
@@ -258,7 +237,6 @@ class DA3_Streaming:
             start_idx, end_idx = range_2
             chunk_image_paths += self.img_list[start_idx:end_idx]
 
-        # images = load_and_preprocess_images(chunk_image_paths).to(self.device)
         print(f"Loaded {len(chunk_image_paths)} images")
 
         ref_view_strategy = self.config["Model"][
@@ -269,21 +247,13 @@ class DA3_Streaming:
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=self.dtype):
                 images = chunk_image_paths
-                # images: ['xxx.png', 'xxx.png', ...]
-
                 predictions = self.model.inference(images, ref_view_strategy=ref_view_strategy)
 
                 predictions.depth = np.squeeze(predictions.depth)
                 predictions.conf -= 1.0
 
-                print(predictions.processed_images.shape)  # [N, H, W, 3] uint8
-                print(predictions.depth.shape)  # [N, H, W] float32
-                print(predictions.conf.shape)  # [N, H, W] float32
-                print(predictions.extrinsics.shape)  # [N, 3, 4] float32 (w2c)
-                print(predictions.intrinsics.shape)  # [N, 3, 3] float32
         torch.cuda.empty_cache()
 
-        # Save predictions to disk instead of keeping in memory
         if is_loop:
             save_dir = self.result_loop_dir
             filename = f"loop_{range_1[0]}_{range_1[1]}_{range_2[0]}_{range_2[1]}.npy"
@@ -491,7 +461,6 @@ class DA3_Streaming:
         x0, _, y0 = extract_xyz(input_abs_poses)
         x1, _, y1 = extract_xyz(optimized_abs_poses)
 
-        # Visual in png format
         plt.figure(figsize=(8, 6))
         plt.plot(x0, y0, "o--", alpha=0.45, label="Before Optimization")
         plt.plot(x1, y1, "o-", label="After Optimization")
@@ -589,7 +558,7 @@ class DA3_Streaming:
 
         if self.loop_enable:
             self.loop_list = self.get_loop_pairs()
-            del self.loop_detector  # Save GPU Memory
+            del self.loop_detector 
 
             torch.cuda.empty_cache()
 
@@ -601,7 +570,6 @@ class DA3_Streaming:
             )
             loop_results = remove_duplicates(loop_results)
             print(loop_results)
-            # return e.g. (31, (1574, 1594), 2, (129, 149))
             for item in loop_results:
                 single_chunk_predictions = self.process_single_chunk(
                     item[1], range_2=item[3], is_loop=True
@@ -614,11 +582,11 @@ class DA3_Streaming:
 
             input_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(
                 self.sim3_list
-            )  # just for plot
+            ) 
             self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
             optimized_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(
                 self.sim3_list
-            )  # just for plot
+            ) 
 
             self.plot_loop_closure(
                 input_abs_poses, optimized_abs_poses, save_name="sim3_opt_result.png"
@@ -664,9 +632,9 @@ class DA3_Streaming:
                 confs_first = chunk_data_first.conf
                 ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
                 save_confident_pointcloud_batch(
-                    points=points_first,  # shape: (H, W, 3)
-                    colors=colors_first,  # shape: (H, W, 3)
-                    confs=confs_first,  # shape: (H, W)
+                    points=points_first,  
+                    colors=colors_first,  
+                    confs=confs_first,  
                     output_path=ply_path_first,
                     conf_threshold=np.mean(confs_first)
                     * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
@@ -681,9 +649,9 @@ class DA3_Streaming:
             confs = aligned_chunk_data["conf"].reshape(-1)
             ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1}_pcd.ply")
             save_confident_pointcloud_batch(
-                points=points,  # shape: (H, W, 3)
-                colors=colors,  # shape: (H, W, 3)
-                confs=confs,  # shape: (H, W)
+                points=points,  
+                colors=colors,  
+                confs=confs,  
                 output_path=ply_path,
                 conf_threshold=np.mean(confs)
                 * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
@@ -705,7 +673,6 @@ class DA3_Streaming:
             glob.glob(os.path.join(self.img_dir, "*.jpg"))
             + glob.glob(os.path.join(self.img_dir, "*.png"))
         )
-        # print(self.img_list)
         if len(self.img_list) == 0:
             raise ValueError(f"[DIR EMPTY] No images found in {self.img_dir}!")
         print(f"Found {len(self.img_list)} images")
@@ -713,22 +680,10 @@ class DA3_Streaming:
         self.process_long_sequence()
 
     def save_camera_poses(self):
-        """
-        Save camera poses from all chunks to txt and ply files
-        - txt file: Each line contains a 4x4 C2W matrix flattened into 16 numbers
-        - ply file: Camera poses visualized as points with different colors for each chunk
-        """
         chunk_colors = [
-            [255, 0, 0],  # Red
-            [0, 255, 0],  # Green
-            [0, 0, 255],  # Blue
-            [255, 255, 0],  # Yellow
-            [255, 0, 255],  # Magenta
-            [0, 255, 255],  # Cyan
-            [128, 0, 0],  # Dark Red
-            [0, 128, 0],  # Dark Green
-            [0, 0, 128],  # Dark Blue
-            [128, 128, 0],  # Olive
+            [255, 0, 0],  [0, 255, 0],  [0, 0, 255],  [255, 255, 0],
+            [255, 0, 255], [0, 255, 255], [128, 0, 0],  [0, 128, 0],
+            [0, 0, 128],  [128, 128, 0],
         ]
         print("Saving all camera poses to txt file...")
 
@@ -750,9 +705,7 @@ class DA3_Streaming:
         for chunk_idx in range(1, len(self.all_camera_poses)):
             chunk_range, chunk_extrinsics = self.all_camera_poses[chunk_idx]
             _, chunk_intrinsics = self.all_camera_intrinsics[chunk_idx]
-            s, R, t = self.sim3_list[
-                chunk_idx - 1
-            ]  # When call self.save_camera_poses(), all the sim3 are aligned to the first chunk.
+            s, R, t = self.sim3_list[chunk_idx - 1] 
 
             S = np.eye(4)
             S[:3, :3] = s * R
@@ -769,8 +722,8 @@ class DA3_Streaming:
                 w2c[:3, :] = chunk_extrinsics[i + self.overlap_s]
                 c2w = np.linalg.inv(w2c)
 
-                transformed_c2w = S @ c2w  # Be aware of the left multiplication!
-                transformed_c2w[:3, :3] /= s  # Normalize rotation
+                transformed_c2w = S @ c2w  
+                transformed_c2w[:3, :3] /= s  
 
                 all_poses[idx] = transformed_c2w
                 all_intrinsics[idx] = chunk_intrinsics[i + self.overlap_s]
@@ -796,7 +749,6 @@ class DA3_Streaming:
 
         ply_path = os.path.join(self.output_dir, "camera_poses.ply")
         with open(ply_path, "w") as f:
-            # Write PLY header
             f.write("ply\n")
             f.write("format ascii 1.0\n")
             f.write(f"element vertex {len(all_poses)}\n")
@@ -818,18 +770,6 @@ class DA3_Streaming:
         print(f"Camera poses visualization saved to {ply_path}")
 
     def close(self):
-        """
-        Clean up temporary files and calculate reclaimed disk space.
-
-        This method deletes all temporary files generated during processing from three directories:
-        - Unaligned results
-        - Aligned results
-        - Loop results
-
-        ~50 GiB for 4500-frame KITTI 00,
-        ~35 GiB for 2700-frame KITTI 05,
-        or ~5 GiB for 300-frame short seq.
-        """
         if not self.delete_temp_files:
             return
 
@@ -863,9 +803,7 @@ class DA3_Streaming:
 def copy_file(src_path, dst_dir):
     try:
         os.makedirs(dst_dir, exist_ok=True)
-
         dst_path = os.path.join(dst_dir, os.path.basename(src_path))
-
         shutil.copy2(src_path, dst_path)
         print(f"config yaml file has been copied to: {dst_path}")
         return dst_path
@@ -879,7 +817,6 @@ def copy_file(src_path, dst_dir):
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(description="DA3-Streaming")
     parser.add_argument("--image_dir", type=str, required=True, help="Image path")
     parser.add_argument(
@@ -887,9 +824,10 @@ if __name__ == "__main__":
         type=str,
         required=False,
         default="./configs/base_config.yaml",
-        help="Image path",
+        help="Config path",
     )
     parser.add_argument("--output_dir", type=str, required=False, default=None, help="Output path")
+    parser.add_argument("--conf_threshold", type=float, required=False, default=0.0, help="Confidence slider value mapping")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -912,7 +850,7 @@ if __name__ == "__main__":
     if config["Model"]["align_lib"] == "numba":
         warmup_numba()
 
-    da3_streaming = DA3_Streaming(image_dir, save_dir, config)
+    da3_streaming = DA3_Streaming(image_dir, save_dir, config, conf_threshold=args.conf_threshold)
     da3_streaming.run()
     da3_streaming.close()
 
